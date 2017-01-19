@@ -1,11 +1,11 @@
 -- created by lzw @ 2017-1-18
 -- 功能：文件下载器
+-- 需要模块： luasocket
 -- 断点模式流程:
 -- step1. 发送 range:"bytes=0-0" 获取网络文件大小
 -- step2. 计算要获取的片段，然后检查ETag是否与本地文件一致，不一致重新下载
 -- step3. 写入文件，并判断文件是否已经写满，写满返回callback("success")
 
--- Notice: Resume模式需要修改 C++ LuaMinXmlHttpRequest::_sendRequest，原生的cocos代码将断点回传的206响应当做错误处理了
 -- Usage: 七牛云测试通过
 --[[
 	local Downloader = require "Downloader"
@@ -17,6 +17,10 @@
 	dw:start(true) -- true: 断点续存模式
 --]]
 
+
+local http = require("socket.http")
+local ltn12 = require("ltn12")
+
 local Downloader = class("Downloader", cc.Node)
 
 function Downloader:ctor(parent, savePath, url, callback)
@@ -24,7 +28,7 @@ function Downloader:ctor(parent, savePath, url, callback)
 	self.totleTryTimes = 3				-- 重试次数
 	self.tryTimes = self.totleTryTimes
 	self.tryInterval = 5 				-- 重试间隔s
-	self.timeout = 3 					-- http超时设置
+	self.timeout = 10 					-- http超时设置
 	self.savePath = savePath
 	self.rangeBytes = 1 * 1024  	-- 1MB的分片大小
 	self.totleSize = nil
@@ -75,30 +79,35 @@ end
 
 function Downloader:httpRequest(method, url, callback, param)
 	param = param or {}
+	http.TIMEOUT = param.timeout
 
-	local xhr = cc.XMLHttpRequest:new()
-	xhr.responseType = cc.XMLHTTPREQUEST_RESPONSE_STRING
-	xhr.timeout = param.timeout or 3
-	xhr:open(method, url)
+	local data = {}
+	local ret, code, headers = http.request{
+		url = url,
+		method = method,
+		headers = param.headers,
+		sink = ltn12.sink.table(data),
+	}
 
-	for k, v in pairs(param.headers) do
-		xhr:setRequestHeader(k, v)
+	if not ret then callback() end
+
+	local noSupportRangCode = 416
+	if code == noSupportRangCode then
+		self.isResume = false
+		return self:start(self.isResume)
 	end
 
-	local function onReadyStateChanged()
-	    if xhr.readyState == 4 and (xhr.status >= 200 and xhr.status < 207) then
-    		local headers = xhr:getAllResponseHeaders()
-    		headers = self:mapHeaders(headers)
-    		callback(xhr.response, headers)
-	    else
-	        print("xhr.readyState is:", xhr.readyState, "xhr.status is: ",xhr.status)
-	        callback()
-	    end
-	    xhr:unregisterScriptHandler()
+	if not(code == 200 or code == 206) then
+		return callback()
 	end
 
-	xhr:registerScriptHandler(onReadyStateChanged)
-	xhr:send(param.data)
+	if not self:checkETag(headers, size) then
+		os.remove(self.savePath)
+		return self:start(self.isResume)
+	end
+
+	local binStr = table.concat(data) or ""
+	callback(binStr, headers, code)
 end
 
 function Downloader:startAfterNetFileSize()
@@ -111,15 +120,10 @@ function Downloader:startAfterNetFileSize()
 		},
 		timeout = self.timeout,
 	}
-	self:httpRequest("GET", self.url, function(data, headers)
+	self:httpRequest("GET", self.url, function(data, headers, code)
 		if data == nil then
 			local func = handler(self, self.startAfterNetFileSize)
 			return self:tryAgain(func)
-		end
-
-		if not self:checkETag(headers, size) then
-			os.remove(self.savePath)
-			return self:start(self.isResume)
 		end
 
 		local wantSize = self:getFileSize(headers)
@@ -131,7 +135,7 @@ function Downloader:startAfterNetFileSize()
 		if wantSize <= nowSize then
 			return self:onSuccess()
 		end
-		self:download()
+		-- self:download()
 	end, param)
 end
 
@@ -156,16 +160,11 @@ function Downloader:download()
 		},
 		timeout = self.timeout,
 	}
-	print(range)
+
 	self:httpRequest("GET", self.url, function(data, headers)
 		if data == nil then
 			local func = handler(self, self.download)
 			return self:tryAgain(func)
-		end
-
-		if not self:checkETag(headers, size) then
-			os.remove(self.savePath)
-			return self:start(self.isResume)
 		end
 
 		io.writefile(self.savePath, data, "a+b")
@@ -187,11 +186,11 @@ end
 
 function Downloader:checkETag(headers, size)
 	if size and size == 0 and self.isResume then
-		self:saveETagFile(self.savePath, headers["ETag"])
+		self:saveETagFile(self.savePath, headers["etag"])
 	end
 	if size and size > 0 and self.isResume then
 		local eTag = self:readETagFile(self.savePath)
-		if headers["ETag"] ~= eTag then
+		if headers["etag"] ~= eTag then
 			os.remove(self.savePath)
 			return false
 		end
@@ -204,7 +203,7 @@ function Downloader:getFileSize(headers)
 		return self.totleSize
 	end
 	self.totleSize = 0
-	local value = headers["Content-Range"]
+	local value = headers["content-range"]
 	if value ~= nil then
 		self.totleSize = tonumber(string.match(value, "%d+$"))
 	end
